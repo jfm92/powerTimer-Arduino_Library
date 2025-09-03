@@ -1,0 +1,34 @@
+#######################################
+# Syntax Highlighting for powerTimer
+#######################################
+
+#######################################
+# Class (KEYWORD1)
+#######################################
+
+powerTimer	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+setTime	KEYWORD2
+enableAlarmInterrupt	KEYWORD2
+disableAlarmInterrupt	KEYWORD2
+readAlarmInterruptFlag	KEYWORD2
+clearAlarmInterruptFlag	KEYWORD2
+setTimer	KEYWORD2
+disableTimer	KEYWORD2
+disableTimerInterrupt	KEYWORD2
+readTimerInterruptFlag	KEYWORD2
+clearTimerInterruptFlag	KEYWORD2
+dateIntegrity	KEYWORD2
+status	KEYWORD2
+clearInterrupts	KEYWORD2
+powerOff	KEYWORD2
+reset	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
