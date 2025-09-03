@@ -3,309 +3,506 @@
 
 bool powerTimer::begin(uint8_t powerOffPin, TwoWire &wirePort)
 {
-  bool result = false;
+	bool result = false;
+	_wirePort = &wirePort;
+	_powerOffPin = powerOffPin;
 
-  _powerOffPin = powerOffPin;
-  _wirePort = &wirePort;
+	//Check if the device is connected
+	_wirePort->beginTransmission(RV3028_ADDR);
+	if (_wirePort->endTransmission() != 0)
+	{
+		return result;
+	}
 
-  _wirePort->beginTransmission(ADDR);
-  if (_wirePort->endTransmission() != 0)
-  {
-    //Device not found
-    return result;
-  }
+	pinMode(_powerOffPin, OUTPUT);
 
-  //TODO: Disable clock output, 24hours mode, trickcharge backupswitchovermode
+	delay(1);
+	set24Hour(); 
 
-  return result;
+	result = true;
+
+	return result;
 }
 
-void powerTimer::clearInterrupt(interruptType_t intType)
+bool powerTimer::setTime(uint8_t sec, uint8_t min, uint8_t hour, uint8_t weekday, uint8_t date, uint8_t month, uint16_t year)
 {
-  uint8_t regPosition = (intType == ALARM_INT) ? STATUS_AF : STATUS_TF;
-  clearBit(STATUS, regPosition);
+	bool result = false;
+
+	_time[TIME_SECONDS] = DECtoBCD(sec);
+	_time[TIME_MINUTES] = DECtoBCD(min);
+	_time[TIME_HOURS] = DECtoBCD(hour);
+	_time[TIME_WEEKDAY] = DECtoBCD(weekday);
+	_time[TIME_DATE] = DECtoBCD(date);
+	_time[TIME_MONTH] = DECtoBCD(month);
+	_time[TIME_YEAR] = DECtoBCD(year - 2000);
+
+	if(!writeMultipleRegisters(RV3028_SECONDS, _time, TIME_ARRAY_LENGTH)){
+		return result;
+	}
+
+	uint8_t _timeRead[TIME_ARRAY_LENGTH];
+	if(!readMultipleRegisters(RV3028_SECONDS, _timeRead, TIME_ARRAY_LENGTH)){
+		return result;
+	}
+
+	result = (_time == _timeRead) ? true : false; //Check if saved data is correct.
+
+	return result;
 }
 
-bool powerTimer::readInterrupt(interruptType_t intType)
+
+void powerTimer::enableAlarmInterrupt(uint8_t min, uint8_t hour, uint8_t dateOrWeekDay, bool setWeekDayAlarm)
 {
-  return readBit(STATUS, (intType == ALARM_INT) ? STATUS_AF : STATUS_TF);
+	disableAlarmInterrupt();
+	clearAlarmInterruptFlag();
+
+	set24Hour();
+
+	if (setWeekDayAlarm){
+		clearBit(RV3028_CTRL1, CTRL1_WADA);
+	}
+	else{
+		setBit(RV3028_CTRL1, CTRL1_WADA);
+	}
+
+	uint8_t alarmTime[3];
+
+	alarmTime[0] = DECtoBCD(min);
+	alarmTime[1] = DECtoBCD(hour);
+	alarmTime[2] = DECtoBCD(dateOrWeekDay);
+
+	writeMultipleRegisters(RV3028_MINUTES_ALM, alarmTime, 3);
+
+	setBit(RV3028_CTRL2, CTRL2_AIE);
 }
 
-void powerTimer::disableInterrupt(interruptType_t intType)
+void powerTimer::disableAlarmInterrupt()
 {
-  clearBit(CTRL2, (intType == ALARM_INT) ? CTRL2_AIE : CTRL2_TIE);
+	clearBit(RV3028_CTRL2, CTRL2_AIE);
 }
 
-void powerTimer::enableInterrupt(interruptType_t intType)
+bool powerTimer::readAlarmInterruptFlag()
 {
-  setBit(CTRL2, (intType == ALARM_INT) ? CTRL2_AIE : CTRL2_TIE);
+	return readBit(RV3028_STATUS, STATUS_AF);
 }
 
-bool powerTimer::setTimerPeriod(uint16_t secondsPeriod)
+void powerTimer::clearAlarmInterruptFlag()
 {
-  bool result = false;
+	clearBit(RV3028_STATUS, STATUS_AF);
+}
 
-  if((secondsPeriod > 0) && (secondsPeriod > 3932100)){
-    //Out of valid range, the timer must between 1 second and 3932100 seconds (45,5 days)
-    //This is a restriction of the available RTC frequency and the type of data used (uint16_t)
-    return result;
-  }
+/*********************************
+Countdown Timer Interrupt
+********************************/
+bool powerTimer::setTimer(bool timerRepeat, uint16_t timerValue, bool setInterrupt, bool startTimer)
+{
+	bool result = false;
 
-  disableTimerPeriod();
-  disableInterrupt(TIMER_INT);
-  clearInterrupt(TIMER_INT);
+	if((timerValue > 3932100) || (timerValue == 0)){
+		Serial.println("outof range");
+		return result;
+	}
 
-  //Set required frequency configuration.
-  uint8_t ctrl1Val = readReg(CTRL1);
-  if(secondsPeriod > 65535 ) //Max period allowed by 1Hz frequency (65535 secs == 18h 12min), set 1/60Hz freq
-  {
-    ctrl1Val &= ~3;
+	disableTimer();
+	disableTimerInterrupt();
+	clearTimerInterruptFlag();
+
+	if(!writeRegister(RV3028_TIMERVAL_0, timerValue & 0xff)){
+		return result;
+	}
+
+	if(!writeRegister(RV3028_TIMERVAL_1, timerValue >> 8)){
+		return result;
+	}
+
+	uint8_t ctrl1Val = readRegister(RV3028_CTRL1);
+	if (timerRepeat){
+		ctrl1Val |= 1 << CTRL1_TRPT;
+	}
+	else{
+		ctrl1Val &= ~(1 << CTRL1_TRPT);
+	}
+
+	if(timerValue <= 65535){
+		//1Hz frequency
+		ctrl1Val &= ~3; // Clear both the bits
 		ctrl1Val |= 2;
-  }
-  else{
-    ctrl1_val |= 3;
-  }
+	}
+	else{
+		// 1/60Hz
+		ctrl1Val &= ~3; // Clear both the bits
+	}
 
-  if(!writeReg(CTRL1, ctrl1Val)){
-    return result;
-  }
+	//Enable Timer interrupt
+	setBit(RV3028_CTRL2, CTRL2_TIE);
 
-  // Set period value
-  if(!writeReg(TIMERVAL_0, secondsPeriod & 0xff) || !writeReg(TIMERVAL_1, secondsPeriod >> 8)){
-    return result;
-  }
+	if (startTimer){
+		ctrl1Val |= (1 << CTRL1_TE);
+	}
 
-  result = true;
+	if(!writeRegister(RV3028_CTRL1, ctrl1Val)){
+		return result;
+	}
 
-  return result;
+	setBit(RV3028_CTRL1, CTRL1_TE);
+
+	result = true;
+	return result;
 }
 
-bool powerTimer::enableTimerPeriod(void)
+void powerTimer::disableTimerInterrupt()
 {
-  bool result = false
-  enableInterrupt(TIMER_INT);
-
-  if(!setBit(CTRL1, CTRL1_TE)){
-    return result;
-  }
-
-  result = true;
-  return result;
+	clearBit(RV3028_CTRL2, CTRL2_TIE);
 }
 
-bool powerTimer::disableTimerPeriod(void)
+bool powerTimer::readTimerInterruptFlag()
 {
-  bool result = false;
-  disableInterrupt(TIMER_INT);
-  clearInterrupt(TIMER_INT);
-
-  if(!clearBit(CTRL1, CTRL1_TE)){
-    return result;
-  }
-
-  result = true;
-  return result;
-
+	return readBit(RV3028_STATUS, STATUS_TF);
 }
 
-bool powerTimer::setAlarmDate(const struct tm &newAlarmTime)
+void powerTimer::clearTimerInterruptFlag()
 {
-  bool result = false;
-  
-  disableInterrupt(ALARM_INT);
-  clearInterrupt(ALARM_INT);
-
-  uint8_t alarmTime[3];
-  alarmTime[0] = DECtoBCD(newAlarmTime.tm_min);
-  alarmTime[1] = DECtoBCD(newAlarmTime.tm_hour);
-  alarmTime[2] = DECtoBCD(newAlarmTime.tm_mday);
-
-  if(!writeMultipleReg(RV3028_MINUTES_ALM, alarmTime, 3)){  
-    return result;
-  }
-
-  result = true;
-  return result;
+	clearBit(RV3028_STATUS, STATUS_TF);
 }
 
-bool powerTimer::enableAlarmDate(void)
+void powerTimer::disableTimer()
 {
-  bool result = false;
-  enableInterrupt(ALARM_INT);
-
-  if(!setBit(CTRL2, CTRL2_AIE)){
-    return result;
-  }
-
-  result = true;
-  return result;
+	clearBit(RV3028_CTRL1, CTRL1_TE);
 }
 
-bool powerTimer::disableAlarmDate(void)
+bool powerTimer::dateIntegrity()
 {
-  bool result = false;
-  disableInterrupt(ALARM_INT);
-  clearInterrupt(ALARM_INT);
+	constexpr uint8_t PORF_MASK = 0b00000001; // Bit 0
+	constexpr uint8_t BSF_MASK = 0b00100000; // Bit 5
 
-  if(!clearBit(CTRL2, CTRL2_AIE)){
-    return result;
-  }
+	uint8_t statusRegister = status();
 
-  result = true;
-  return result;
+	bool porf = statusRegister & PORF_MASK;
+	bool bsf = statusRegister & BSF_MASK;
+
+	return !(porf || bsf);
 }
 
-bool powerTimer::setRTCDate(const struct tm &dateTime)
+uint8_t powerTimer::status(void)
 {
-  bool result = false;
-  uint8_t date[7];
-  date[0] = DECtoBCD(dateTime.tm_sec);
-  date[1] = DECtoBCD(dateTime.tm_min);
-  date[2] = DECtoBCD(dateTime.tm_hour);
-  date[3] = DECtoBCD(dateTime.tm_wday);
-  date[4] = DECtoBCD(dateTime.tm_mday);
-  date[5] = DECtoBCD(dateTime.tm_mon + 1);
-  date[6] = DECtoBCD(dateTime.tm_year - 2000);
-
-  if(!writeMultipleReg(RV3028_SECONDS, date, 7)){
-    return result;
-  }
-
-  result = true;
-  return result;
+	return(readRegister(RV3028_STATUS));
 }
 
-void powerTimer::getRTCDate(struct tm &dateTime)
+void powerTimer::clearInterrupts()
 {
-  bool result = false;
-  uint8_t date[7];
-
-  if(!readMultipleReg(RV3028_SECONDS, date, 7)){
-    return result;
-  }
-
-  dateTime.tm_sec = BCDtoDEC(date[0]);
-  dateTime.tm_min = BCDtoDEC(date[1]);
-  dateTime.tm_hour = BCDtoDEC(date[2]);
-  dateTime.tm_wday = BCDtoDEC(date[3]);
-  dateTime.tm_mday = BCDtoDEC(date[4]);
-  dateTime.tm_mon = BCDtoDEC(date[5]) - 1;
-  dateTime.tm_year = BCDtoDEC(date[6]) + 2000;
-
-  result = true;
-  return result;
+	writeRegister(RV3028_STATUS, 0);
 }
 
-void powerTimer::powerOff(void)
+void powerTimer::powerOff()
 {
-  digitalWrite(_powerOffPin, HIGH);
+	//Configuration to reduce the consumption to the min
+	delay(1);
+	disableTrickleCharge();
+	delay(1);
+	setBackupSwitchoverMode(0x00);
+	delay(1);
+
+	digitalWrite(_powerOffPin, HIGH);
 }
 
-uint8_t powerTimer::readReg(uint8_t regAddr)
+/*********************************
+PRIVATE FUNCTIONS
+********************************/
+uint8_t powerTimer::BCDtoDEC(uint8_t val)
 {
-  uint8_t result = 0xFF;//Error code
-
-  _wirePort->beginTransmission(ADDR);
-  _wirePort->write(regAddr);
-  _wirePort->endTransmission();
-
-  _wirePort->requestFrom(ADDR, 1);
-  if (_wirePort->available())
-  {
-    result = _wirePort->read();
-  }
-
-  return result;
+	return ((val / 0x10) * 10) + (val % 0x10);
 }
 
-bool powerTimer::writeReg(uint8_t regAddr, uint8_t regVal)
+uint8_t powerTimer::DECtoBCD(uint8_t val)
 {
-  uint8_t result = false;
-
-  _wirePort->beginTransmission(ADDR);
-  _wirePort->write(regAddr);
-  _wirePort->write(regVal);
-  if (_wirePort->endTransmission() == 0)
-  {
-    result = true;
-  }
-
-  return result;
+	return ((val / 10) * 0x10) + (val % 10);
 }
 
-bool powerTimer::readMultipleReg(uint8_t regAddr, uint8_t *dest, uint8_t len)
+uint8_t powerTimer::readRegister(uint8_t addr)
 {
-  bool result = false;
-  _wirePort->beginTransmission(ADDR);
-  _wirePort->write(regAddr);
-  if(_wirePort->endTransmission() != 0){
-    return result;
-  }
+	uint8_t result = 0XFF;
 
-  _wirePort->requestFrom(ADDR, len);
-  if (_wirePort->available() == len)
-  {
-    for (uint8_t i = 0; i < len; i++)
-    {
-      dest[i] = _wirePort->read();
-    }
-    result = true;
-  }
+	_wirePort->beginTransmission(RV3028_ADDR);
+	_wirePort->write(addr);
+	_wirePort->endTransmission();
 
-  return result;
+	_wirePort->requestFrom(RV3028_ADDR, (uint8_t)1);
+
+	if (_wirePort->available()) {
+		result = _wirePort->read();
+	}
+
+	return result;
 }
 
-bool powerTimer::writeMultipleReg(uint8_t regAddr, uint8_t *values, uint8_t len)
+bool powerTimer::writeRegister(uint8_t addr, uint8_t val)
 {
-  bool result = false;
-  _wirePort->beginTransmission(ADDR);
-  _wirePort->write(regAddr);
-  for (uint8_t i = 0; i < len; i++)
-  {
-    _wirePort->write(values[i]);
-  }
-  if (_wirePort->endTransmission() == 0)
-  {
-    result = true;
-  }
+	bool result = false;
 
-  return result;
+	_wirePort->beginTransmission(RV3028_ADDR);
+	_wirePort->write(addr);
+	_wirePort->write(val);
+
+	if (_wirePort->endTransmission() == 0){
+		result = true;
+	}
+
+	return result;
 }
 
-bool powerTimer::setBit(uint8_t regAddr, uint8_t bitNum) 
-{ 
-  bool result = false;
-  uint8_t val = readReg(regAddr);
-  val |= (1 << bitNum);
-  if(writeReg(regAddr, val)){
-    result = true;
-  }
-  return result;
-}
-
-bool powerTimer::clearBit(uint8_t regAddr, uint8_t bitNum) 
-{ 
-  bool result = false;
-  uint8_t val = readReg(regAddr);
-  val &= ~(1 << bitNum);
-  if(writeReg(regAddr, val)){
-    result = true;
-  }
-  return result;
-}
-
-bool powerTimer::readBit(uint8_t regAddr, uint8_t bitNum) 
+bool powerTimer::readMultipleRegisters(uint8_t addr, uint8_t * dest, uint8_t len)
 {
-  bool result = false;
-  uint8_t val = readReg(regAddr);
-  val &= (1 << bitNum);
-  if(val == 0){
-    result = true;
-  }
-  return result;
+	bool result = false;
+
+	_wirePort->beginTransmission(RV3028_ADDR);
+	_wirePort->write(addr);
+	if (_wirePort->endTransmission() != 0){
+	return result;
+	}
+
+	_wirePort->requestFrom(RV3028_ADDR, len);
+	for (uint8_t i = 0; i < len; i++)
+	{
+		dest[i] = _wirePort->read();
+	}
+
+	result = true;
+	return result;
 }
 
-uint8_t powerTimer::BCDtoDEC(uint8_t val) { return ((val / 0x10) * 10) + (val % 0x10); }
-uint8_t powerTimer::DECtoBCD(uint8_t val) { return ((val / 10) * 0x10) + (val % 10); }
+bool powerTimer::writeMultipleRegisters(uint8_t addr, uint8_t * values, uint8_t len)
+{
+	bool result = false;
 
-#endif // powerTimer_h
+	_wirePort->beginTransmission(RV3028_ADDR);
+	_wirePort->write(addr);
+	for (uint8_t i = 0; i < len; i++)
+	{
+		_wirePort->write(values[i]);
+	}
+
+	if (_wirePort->endTransmission() == 0){
+	result = true;
+	}
+
+	return result;
+}
+
+bool powerTimer::writeConfigEEPROM_RAMmirror(uint8_t eepromaddr, uint8_t val)
+{
+	bool success = waitforEEPROM();
+
+	//Disable auto refresh by writing 1 to EERD control bit in CTRL1 register
+	uint8_t ctrl1 = readRegister(RV3028_CTRL1);
+	ctrl1 |= 1 << CTRL1_EERD;
+	if (!writeRegister(RV3028_CTRL1, ctrl1)) success = false;
+	//Write Configuration RAM Register
+	writeRegister(eepromaddr, val);
+	//Update EEPROM (All Configuration RAM -> EEPROM)
+	writeRegister(RV3028_EEPROM_CMD, EEPROMCMD_First);
+	writeRegister(RV3028_EEPROM_CMD, EEPROMCMD_Update);
+	if (!waitforEEPROM()) success = false;
+	//Reenable auto refresh by writing 0 to EERD control bit in CTRL1 register
+	ctrl1 = readRegister(RV3028_CTRL1);
+	if (ctrl1 == 0x00)success = false;
+	ctrl1 &= ~(1 << CTRL1_EERD);
+	writeRegister(RV3028_CTRL1, ctrl1);
+	if (!waitforEEPROM()) success = false;
+
+	return success;
+}
+
+uint8_t powerTimer::readConfigEEPROM_RAMmirror(uint8_t eepromaddr)
+{
+	bool success = waitforEEPROM();
+
+	//Disable auto refresh by writing 1 to EERD control bit in CTRL1 register
+	uint8_t ctrl1 = readRegister(RV3028_CTRL1);
+	ctrl1 |= 1 << CTRL1_EERD;
+	if (!writeRegister(RV3028_CTRL1, ctrl1)) success = false;
+	//Read EEPROM Register
+	writeRegister(RV3028_EEPROM_ADDR, eepromaddr);
+	writeRegister(RV3028_EEPROM_CMD, EEPROMCMD_First);
+	writeRegister(RV3028_EEPROM_CMD, EEPROMCMD_ReadSingle);
+	if (!waitforEEPROM()) success = false;
+	uint8_t eepromdata = readRegister(RV3028_EEPROM_DATA);
+	if (!waitforEEPROM()) success = false;
+	//Reenable auto refresh by writing 0 to EERD control bit in CTRL1 register
+	ctrl1 = readRegister(RV3028_CTRL1);
+	if (ctrl1 == 0x00)success = false;
+	ctrl1 &= ~(1 << CTRL1_EERD);
+	writeRegister(RV3028_CTRL1, ctrl1);
+
+	if (!success) return 0xFF;
+	return eepromdata;
+}
+
+bool powerTimer::writeUserEEPROM(uint8_t eepromaddr, uint8_t val)
+{
+	bool success = waitforEEPROM();
+
+	//Disable auto refresh by writing 1 to EERD control bit in CTRL1 register
+	uint8_t ctrl1 = readRegister(RV3028_CTRL1);
+	ctrl1 |= 1 << CTRL1_EERD;
+	if (!writeRegister(RV3028_CTRL1, ctrl1)) success = false;
+	//Write addr to EEADDR
+	writeRegister(0x25, eepromaddr);
+	//Write value to EEDATA
+	writeRegister(0x26, val);
+	//Update EEPROM (All Configuration RAM -> EEPROM)
+	writeRegister(RV3028_EEPROM_CMD, EEPROMCMD_First);
+	writeRegister(RV3028_EEPROM_CMD, EEPROMCMD_WriteSingle);
+	if (!waitforEEPROM()) success = false;
+	//Reenable auto refresh by writing 0 to EERD control bit in CTRL1 register
+	ctrl1 = readRegister(RV3028_CTRL1);
+	if (ctrl1 == 0x00)success = false;
+	ctrl1 &= ~(1 << CTRL1_EERD);
+	writeRegister(RV3028_CTRL1, ctrl1);
+	if (!waitforEEPROM()) success = false;
+
+	return success;
+}
+
+uint8_t powerTimer::readUserEEPROM(uint8_t eepromaddr)
+{
+	bool success = waitforEEPROM();
+
+	//Disable auto refresh by writing 1 to EERD control bit in CTRL1 register
+	uint8_t ctrl1 = readRegister(RV3028_CTRL1);
+	ctrl1 |= 1 << CTRL1_EERD;
+	if (!writeRegister(RV3028_CTRL1, ctrl1)) success = false;
+	//Read EEPROM Register
+	writeRegister(RV3028_EEPROM_ADDR, eepromaddr);
+	writeRegister(RV3028_EEPROM_CMD, EEPROMCMD_First);
+	writeRegister(RV3028_EEPROM_CMD, EEPROMCMD_ReadSingle);
+	if (!waitforEEPROM()) success = false;
+	uint8_t eepromdata = readRegister(RV3028_EEPROM_DATA);
+	if (!waitforEEPROM()) success = false;
+	//Reenable auto refresh by writing 0 to EERD control bit in CTRL1 register
+	ctrl1 = readRegister(RV3028_CTRL1);
+	if (ctrl1 == 0x00)success = false;
+	ctrl1 &= ~(1 << CTRL1_EERD);
+	writeRegister(RV3028_CTRL1, ctrl1);
+
+	if (!success) return 0xFF;
+	return eepromdata;
+}
+
+bool powerTimer::waitforEEPROM()
+{
+	unsigned long timeout = millis() + 500;
+	while ((readRegister(RV3028_STATUS) & 1 << STATUS_EEBUSY) && millis() < timeout);
+
+	return millis() < timeout;
+}
+
+void powerTimer::reset()
+{
+	setBit(RV3028_CTRL2, CTRL2_RESET);
+}
+
+void powerTimer::setBit(uint8_t regAddr, uint8_t bitNum)
+{
+	uint8_t value = readRegister(regAddr);
+	value |= (1 << bitNum); //Set the bit
+	writeRegister(regAddr, value);
+}
+
+void powerTimer::clearBit(uint8_t regAddr, uint8_t bitNum)
+{
+	uint8_t value = readRegister(regAddr);
+	value &= ~(1 << bitNum); //Clear the bit
+	writeRegister(regAddr, value);
+}
+
+bool powerTimer::readBit(uint8_t regAddr, uint8_t bitNum)
+{
+	uint8_t value = readRegister(regAddr);
+	value &= (1 << bitNum);
+	return value;
+}
+
+void powerTimer::disableTrickleCharge()
+{
+	//Read EEPROM Backup Register (0x37)
+	uint8_t EEPROMBackup = readConfigEEPROM_RAMmirror(EEPROM_Backup_Register);
+	//Write 0 to TCE Bit
+	EEPROMBackup &= ~(1 << EEPROMBackup_TCE_BIT);
+	//Write EEPROM Backup Register
+	writeConfigEEPROM_RAMmirror(EEPROM_Backup_Register, EEPROMBackup);
+}
+
+void powerTimer::set24Hour()
+{
+	uint8_t hour = readRegister(RV3028_HOURS); //Get the current 12 hour formatted time in BCD
+
+	bool pm = false;
+
+	if (hour & (1 << HOURS_AM_PM)) //Is the AM/PM bit set?
+	{
+	pm = true;
+	hour &= ~(1 << HOURS_AM_PM); //Clear the bit
+	}
+
+	//Change to 24 hour mode
+	uint8_t setting = readRegister(RV3028_CTRL2);
+	setting &= ~(1 << CTRL2_12_24); //Clear the 12/24 hr bit
+	writeRegister(RV3028_CTRL2, setting);
+
+	//Given a BCD hour in the 1-12 range, make it 24
+	hour = BCDtoDEC(hour); //Convert core of register to DEC
+
+	if (pm == true) hour += 12; //2PM becomes 14
+	if (hour == 12) hour = 0; //12AM stays 12, but should really be 0
+	if (hour == 24) hour = 12; //12PM becomes 24, but should really be 12
+
+	hour = DECtoBCD(hour); //Convert to BCD
+
+	writeRegister(RV3028_HOURS, hour); //Record this to hours register
+}
+
+void powerTimer::disableClockOut()
+{
+	//Read EEPROM CLKOUT Register (0x35)
+	uint8_t EEPROMClkout = readConfigEEPROM_RAMmirror(EEPROM_Clkout_Register);
+	//Clear CLKOE Bit
+	EEPROMClkout &= ~(1 << EEPROMClkout_CLKOE_BIT);
+	//Write EEPROM CLKOUT Register
+	writeConfigEEPROM_RAMmirror(EEPROM_Clkout_Register, EEPROMClkout);
+
+	//Clear CLKIE Bit
+	clearBit(RV3028_CTRL2, CTRL2_CLKIE);
+}
+
+/*********************************
+0 = Switchover disabled
+1 = Direct Switching Mode
+2 = Standby Mode
+3 = Level Switching Mode
+*********************************/
+bool powerTimer::setBackupSwitchoverMode(uint8_t val)
+{
+	bool result = true;
+
+	if (val > 3){
+	result = false;
+	return result;
+	}
+
+	//Read EEPROM Backup Register (0x37)
+	uint8_t EEPROMBackup = readConfigEEPROM_RAMmirror(EEPROM_Backup_Register);
+	if (EEPROMBackup == 0xFF){
+	result = false;
+	}
+	//Ensure FEDE Bit is set to 1
+	EEPROMBackup |= 1 << EEPROMBackup_FEDE_BIT;
+	//Set BSM Bits (Backup Switchover Mode)
+	EEPROMBackup &= EEPROMBackup_BSM_CLEAR;		//Clear BSM Bits of EEPROM Backup Register
+	EEPROMBackup |= val << EEPROMBackup_BSM_SHIFT;	//Shift values into EEPROM Backup Register
+	//Write EEPROM Backup Register
+	if (!writeConfigEEPROM_RAMmirror(EEPROM_Backup_Register, EEPROMBackup)){
+	result = false;
+	}
+
+	return result;
+}
