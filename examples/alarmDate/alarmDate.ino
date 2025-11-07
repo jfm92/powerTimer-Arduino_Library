@@ -38,7 +38,7 @@ void setup(){
         Serial.println("Set date successfully. 01/01/2025 00:00:00");
     }
 
-    powerTimer.enableAlarmInterrupt(1, 0, 1, true);
+    powerTimer.enableAlarmInterrupt(1, 0, 1, false);
     Serial.println("Alarm interrupt enable in 1 minute.");
 }
 

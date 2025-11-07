@@ -45,7 +45,11 @@ bool powerTimer::setTime(uint8_t sec, uint8_t min, uint8_t hour, uint8_t weekday
 		return result;
 	}
 
-	result = (_time == _timeRead) ? true : false; //Check if saved data is correct.
+	for(uint8_t i = 0; i < TIME_ARRAY_LENGTH; i++){
+		if(_time[i] != _timeRead[i]){
+			return result;
+		}
+	}
 
 	return result;
 }
